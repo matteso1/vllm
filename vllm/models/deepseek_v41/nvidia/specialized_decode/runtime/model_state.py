@@ -26,6 +26,9 @@ import torch
 from torch import nn
 
 from vllm.config import CUDAGraphMode, VllmConfig
+from vllm.model_executor.warmup.flashinfer_autotune_cache import (
+    preload_rank_flashinfer_autotune_cache,
+)
 from vllm.utils.torch_utils import current_stream
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.block_table import BlockTables
@@ -250,4 +253,9 @@ class DeepseekV41SpecializedDecodeModelState(DeepseekV41MetadataGraphModelState)
         ]
         if drafts:
             check_low_batch_graph(vllm_config)
+        self.preloaded_flashinfer_cache = (
+            preload_rank_flashinfer_autotune_cache(vllm_config, model)
+            if self.decode.config.autotune
+            else None
+        )
         warm_up(self.decode, vllm_config, drafts)

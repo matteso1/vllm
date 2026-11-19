@@ -87,3 +87,11 @@ in the future that are more time-consuming or experimental.
 1. **Startup Time Too Long**: Use `-O0` or `-O1` for faster startup, or pass `--disable-flashinfer-autotune` to skip only FlashInfer autotuning
 2. **Compilation Errors**: Use `debug_dump_path` for additional debugging information
 3. **Performance Issues**: Ensure using `-O2` for production
+
+With FlashInfer autotuning enabled, the DeepSeek-V4.1 TP4 low-latency decode
+can reuse saved rank-local tuning tables during model loading. On a warm
+restart, all ranks must accept their tables before specialized warmup uses
+the saved tactics. An early miss still allows the normal warmup to load a
+table later. Auto-fit context lengths and unresolved CUDA graph modes use
+the later lookup. If the configuration key changes after a successful early
+load, startup stops to prevent using tactics from a different configuration.

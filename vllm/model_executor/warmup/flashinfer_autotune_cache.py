@@ -2,11 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """FlashInfer autotune cache helpers."""
 
+import json
 import os
 import tempfile
+from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+import torch
 
 import vllm.envs as envs
 from vllm.config import CacheConfig, MultiModalConfig, VllmConfig, replace
@@ -14,6 +18,9 @@ from vllm.config.utils import hash_config, hash_factors, normalize_value
 from vllm.logger import init_logger
 
 if TYPE_CHECKING:
+    from flashinfer.autotuner import AutoTuner
+    from torch import nn
+
     from vllm.distributed.parallel_state import GroupCoordinator
     from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
@@ -62,9 +69,16 @@ def get_flashinfer_mm_encoder_autotune_config(
 
 
 def flashinfer_autotune_cache_hash(runner: "GPUModelRunner") -> str:
+    return _flashinfer_autotune_cache_hash(
+        runner.vllm_config, lambda: runner.get_model()
+    )
+
+
+def _flashinfer_autotune_cache_hash(
+    vllm_config: VllmConfig, get_model: Callable[[], "nn.Module"]
+) -> str:
     from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 
-    vllm_config: VllmConfig = runner.vllm_config
     cache_config = _normalize_cache_config_for_hash(vllm_config.cache_config)
     if cache_config is not vllm_config.cache_config:
         vllm_config = replace(vllm_config, cache_config=cache_config)
@@ -86,7 +100,7 @@ def flashinfer_autotune_cache_hash(runner: "GPUModelRunner") -> str:
         and not envs.VLLM_MOE_ROUTING_SIMULATION_STRATEGY
         and any(
             isinstance(m, RoutedExperts) and m.supports_precomputed_routing
-            for m in runner.get_model().modules()
+            for m in get_model().modules()
         )
     ):
         factors = {**factors, "moe_routed": True}
@@ -122,13 +136,126 @@ def resolve_flashinfer_autotune_file(runner: "GPUModelRunner") -> Path:
 
 def resolve_rank_flashinfer_autotune_file(runner: "GPUModelRunner") -> Path:
     """The per-rank variant of `resolve_flashinfer_autotune_file`."""
+    path = _rank_flashinfer_autotune_path(
+        runner.vllm_config, flashinfer_autotune_cache_hash(runner)
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _rank_flashinfer_autotune_path(vllm_config: VllmConfig, config_hash: str) -> Path:
     from vllm.distributed.parallel_state import get_world_group
 
-    path = resolve_flashinfer_autotune_file(runner)
-    dp_rank = runner.vllm_config.parallel_config.data_parallel_rank
-    return path.with_name(
-        flashinfer_autotune_filename(dp_rank, get_world_group().rank_in_group)
-    )
+    dp_rank = vllm_config.parallel_config.data_parallel_rank
+    filename = flashinfer_autotune_filename(dp_rank, get_world_group().rank_in_group)
+    return flashinfer_autotune_root() / config_hash / filename
+
+
+def _autotune_cache_fingerprint(path: Path) -> tuple[str, int] | None:
+    """Identify a saved autotune file by its FlashInfer metadata and size."""
+    try:
+        configs = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(configs, dict):
+        return None
+    metadata = configs.pop("_metadata", None)
+    return json.dumps(metadata, sort_keys=True), len(configs)
+
+
+def all_ranks_accept_autotune_cache(accepted: bool, group: "GroupCoordinator") -> bool:
+    if group.world_size == 1:
+        return accepted
+    gathered = [False] * group.world_size
+    torch.distributed.all_gather_object(gathered, accepted, group=group.cpu_group)
+    return all(gathered)
+
+
+def load_shared_autotune_cache(
+    cache_path: Path | None, tuner: "AutoTuner", group: "GroupCoordinator"
+) -> bool:
+    """Keep the file configs only when every rank has and loads its table."""
+    fingerprint = _autotune_cache_fingerprint(cache_path) if cache_path else None
+    if group.world_size > 1:
+        gathered: list[tuple[str, int] | None] = [None] * group.world_size
+        torch.distributed.all_gather_object(
+            gathered, fingerprint, group=group.cpu_group
+        )
+        if any(other != fingerprint for other in gathered):
+            return False
+    if fingerprint is None:
+        return False
+
+    try:
+        loaded = tuner.load_configs(str(cache_path))
+    except (
+        AttributeError,
+        IndexError,
+        KeyError,
+        OSError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        # FlashInfer can reject a malformed file or race a writer after the
+        # fingerprint check. Every rank must still enter the load vote.
+        logger.warning(
+            "Could not load FlashInfer autotune cache %s: %s", cache_path, exc
+        )
+        loaded = False
+    loaded = all_ranks_accept_autotune_cache(loaded, group)
+    if not loaded:
+        tuner.clear_cache()
+    return loaded
+
+
+def _can_resolve_early_autotune_key(
+    vllm_config: VllmConfig, model: "nn.Module"
+) -> bool:
+    model_config = vllm_config.model_config
+    if model_config is not None and model_config.original_max_model_len == -1:
+        # KV sizing will choose a different max_model_len if memory is tight.
+        return False
+    compilation = vllm_config.compilation_config
+    mode = compilation.cudagraph_mode
+    if mode is not None and mode.requires_piecewise_compilation():
+        from vllm.compilation.breakable_cudagraph import is_breakable_cudagraph_enabled
+        from vllm.v1.worker.gpu.cudagraph_utils import has_compiled_submodule
+
+        # KV initialization can downgrade the configured graph mode.
+        return is_breakable_cudagraph_enabled(compilation) or has_compiled_submodule(
+            model
+        )
+    return True
+
+
+def preload_rank_flashinfer_autotune_cache(
+    vllm_config: VllmConfig, model: "nn.Module"
+) -> Path | None:
+    """Load the legacy table ahead of the TP4 specialized decode warmup."""
+    from flashinfer.autotuner import AutoTuner
+
+    from vllm.distributed.parallel_state import get_world_group
+    from vllm.platforms import current_platform
+
+    # Executors otherwise do this after load_model. The final block size is
+    # part of the cache key, including for the weight-cache daemon.
+    current_platform.update_block_size_for_backend(vllm_config)
+    tuner = AutoTuner.get()
+    group = get_world_group()
+    cache_path = None
+    # The pinned FlashInfer coordinates individual cache misses inside
+    # specialized TP tuning. A rejected file load clears the whole tuner.
+    if not (
+        tuner._dirty
+        or tuner.profiling_cache
+        or tuner._file_configs
+        or tuner._namespaced_records
+    ) and _can_resolve_early_autotune_key(vllm_config, model):
+        config_hash = _flashinfer_autotune_cache_hash(vllm_config, lambda: model)
+        cache_path = _rank_flashinfer_autotune_path(vllm_config, config_hash)
+    if load_shared_autotune_cache(cache_path, tuner, group):
+        return cache_path
+    return None
 
 
 def use_flashinfer_autotune_v2(runner: "GPUModelRunner") -> bool:

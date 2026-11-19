@@ -18,6 +18,7 @@ import vllm.model_executor.warmup.kernel_warmup as warmup
 import vllm.utils.flashinfer as fi_utils
 from vllm.config import MultiModalConfig
 from vllm.config.utils import hash_config, hash_factors
+from vllm.model_executor.warmup import flashinfer_autotune_cache as autotune_cache
 from vllm.model_executor.warmup.flashinfer_autotune_cache import (
     _flashinfer_mm_encoder_autotune_hash,
     get_flashinfer_mm_encoder_autotune_config,
@@ -571,13 +572,25 @@ class _AutotuneGroup:
         # Ranks run sequentially: snapshot every rank's file before any saves.
         self.record(("all_gather",))
         if isinstance(obj, bool):
-            out[:] = [rank not in self.run.rejected_load_ranks for rank in self.ranks]
+            if (
+                len(self.run.preloaded) == self.run.pp * self.run.tp
+                and len(self.run.tuners[self.run.rank].load_paths) == 1
+            ):
+                out[:] = [
+                    self.run.preloaded[rank] == self.run.cache_path(rank)
+                    for rank in self.ranks
+                ]
+            else:
+                out[:] = [
+                    rank not in self.run.rejected_load_ranks | self.run.unreadable_ranks
+                    for rank in self.ranks
+                ]
             assert out[self.rank_in_group] == obj
             return
         out[:] = self.run.gathered.setdefault(
             self.ranks,
             [
-                warmup._autotune_cache_fingerprint(self.run.cache_path(rank))
+                autotune_cache._autotune_cache_fingerprint(self.run.cache_path(rank))
                 for rank in self.ranks
             ],
         )
@@ -589,19 +602,30 @@ class _AutotuneGroup:
 class _AutotuneTuner:
     def __init__(self, run):
         self.run = run
-        self.cache = {}
+        self.profiling_cache = {}
+        self._file_configs = {}
+        self._namespaced_records = {}
         self.loaded = None
+        self.load_paths = []
         self._dirty = False
 
+    @property
+    def cache(self):
+        return {**self._file_configs, **self.profiling_cache}
+
     def load_configs(self, path):
+        self.load_paths.append(Path(path))
+        if self.run.rank in self.run.unreadable_ranks:
+            raise FileNotFoundError(path)
         if self.run.rank in self.run.rejected_load_ranks:
             return False
         self.loaded = json.loads(Path(path).read_text())
-        self.cache.update(self.loaded)
+        self._file_configs.update(self.loaded)
         return True
 
     def clear_cache(self):
-        self.cache.clear()
+        self.profiling_cache.clear()
+        self._file_configs.clear()
         self._dirty = False
 
     def save_configs(self, path):
@@ -618,7 +642,7 @@ class _AutotuneTuner:
         for tactic in range(2):
             if group is not None:
                 group.record(("all_reduce", operation, tactic))
-        self.cache[operation] = self.run.rank // self.run.tp
+        self.profiling_cache[operation] = self.run.rank // self.run.tp
         self._dirty = True
 
 
@@ -633,9 +657,12 @@ class _AutotuneRun:
         )
         self.gathered = {}
         self.rejected_load_ranks: set[int] = set()
+        self.unreadable_ranks: set[int] = set()
         self.tuners = {}
         self.saves = []
         self.profile_groups = defaultdict(list)
+        self.dummy_run_ranks = []
+        self.preloaded = {}
 
     def cache_path(self, rank):
         return self.cache_dir / f"autotune_configs_dp0_rank{rank}.json"
@@ -654,17 +681,31 @@ class _AutotuneRun:
         self.tuning_group = group
 
     def dummy_runs(self, runner, *, skip_attn=False):
+        self.dummy_run_ranks.append(self.rank)
         self.tuners[self.rank].profile("shared_gemm")
         if self.pp > 1 and self.rank // self.tp == 0:
             self.tuners[self.rank].profile("pp0_extra_gemm")
 
-    def execute(self):
+    def execute(self, *, before_generic_warmup=None, expected_error=None):
+        self.tuners = {rank: _AutotuneTuner(self) for rank in range(self.pp * self.tp)}
+        if before_generic_warmup is not None:
+            before_generic_warmup()
+            self.gathered.clear()
         for rank in range(self.pp * self.tp):
             self.rank = rank
-            self.tuners[rank] = _AutotuneTuner(self)
             runner = _make_runner([])
             runner.vllm_config.parallel_config.pipeline_parallel_size = self.pp
-            flashinfer_autotune(runner)
+            if self.preloaded:
+                runner.model_state = SimpleNamespace(
+                    preloaded_flashinfer_cache=self.preloaded[rank]
+                )
+            outcome = (
+                pytest.raises(RuntimeError, match=expected_error)
+                if expected_error
+                else nullcontext()
+            )
+            with outcome:
+                flashinfer_autotune(runner)
         return self
 
     def assert_collectives_match(self):
@@ -786,6 +827,175 @@ def test_rejected_cache_retunes_every_rank_in_its_tuning_group(autotune_run, pp,
     rerun.assert_collectives_match()
     assert set(rerun.profile_groups) == set(range(tp))
     assert {rank for rank, _, _ in rerun.saves} == set(range(tp))
+
+
+@pytest.mark.parametrize(
+    "early,late",
+    [
+        ("miss", "hit"),
+        ("full_hit", "same"),
+        ("hit", "same"),
+        ("hit", "rejected_rank"),
+        ("hit", "changed_key"),
+        ("miss", "miss"),
+        ("missing_rank", "hit"),
+        ("rejected_rank", "hit"),
+        ("unreadable_rank", "hit"),
+        ("miss", "rejected_rank"),
+    ],
+)
+def test_specialized_autotune_preserves_cache_and_collectives(
+    autotune_run, monkeypatch, tmp_path, early, late
+):
+    from vllm.config import VllmConfig
+    from vllm.platforms import current_platform
+
+    run = autotune_run(pp=1, tp=4)
+    ranks = range(4)
+    table = {"specialized_gemm": 17, "shared_gemm": 23}
+    if early == "full_hit":
+        table["specialized_only"] = 31
+    monkeypatch.setattr(
+        autotune_cache,
+        "_rank_flashinfer_autotune_path",
+        lambda config, config_hash: run.cache_path(run.rank),
+    )
+    monkeypatch.setattr(
+        current_platform, "update_block_size_for_backend", lambda _: None
+    )
+
+    def prewarm():
+        if early != "miss":
+            for rank in ranks:
+                if early != "missing_rank" or rank != 3:
+                    run.cache_path(rank).write_text(json.dumps(table))
+        if early == "rejected_rank":
+            run.rejected_load_ranks = {3}
+        if early == "unreadable_rank":
+            run.unreadable_ranks = {3}
+        for rank in ranks:
+            run.rank = rank
+            path = autotune_cache.preload_rank_flashinfer_autotune_cache(
+                VllmConfig(), torch.nn.Identity()
+            )
+            if path is not None:
+                run.preloaded[rank] = path
+            tuner = run.tuners[rank]
+            run.set_group(run.tensor_group())
+            tuner.profile("specialized_gemm")
+            tuner.profile("specialized_only")
+            run.set_group(None)
+        run.rejected_load_ranks.clear()
+        run.unreadable_ranks.clear()
+        if (early, late) == ("miss", "hit"):
+            run.cache_dir = tmp_path / "late_key"
+            run.cache_dir.mkdir()
+        if late in ("hit", "rejected_rank"):
+            for rank in ranks:
+                run.cache_path(rank).write_text(json.dumps(table))
+            if late == "rejected_rank":
+                run.rejected_load_ranks = {3}
+        elif late == "changed_key":
+            paths = {rank: run.cache_path(rank) for rank in ranks}
+            paths[3] = tmp_path / "late_key" / paths[3].name
+            paths[3].parent.mkdir()
+            paths[3].write_text(json.dumps({**table, "specialized_gemm": 99}))
+            monkeypatch.setattr(run, "cache_path", paths.__getitem__)
+
+    key_changed = late == "changed_key"
+    run.execute(
+        before_generic_warmup=prewarm,
+        expected_error="FlashInfer autotune cache key changed" if key_changed else None,
+    )
+    run.assert_collectives_match()
+    early_hit = early in ("full_hit", "hit")
+    assert set(run.preloaded) == (set(ranks) if early_hit else set())
+    expect_sweep = late == "miss" or (late == "rejected_rank" and not early_hit)
+    assert run.dummy_run_ranks == (list(ranks) if expect_sweep else [])
+    for rank, tuner in run.tuners.items():
+        if early_hit:
+            assert tuner.load_paths == [run.preloaded[rank]]
+        if key_changed:
+            assert not tuner.cache
+            assert not tuner._dirty
+            continue
+        if late == "rejected_rank" and not early_hit:
+            # Ordinary late-load rejection still clears and retunes the group.
+            assert tuner.cache == {"shared_gemm": 0}
+            continue
+        assert tuner.cache["specialized_gemm"] == (17 if early_hit else 0)
+        assert tuner.cache["specialized_only"] == (31 if early == "full_hit" else 0)
+        assert ("shared_gemm" in tuner._file_configs) == (early_hit or late == "hit")
+        if late == "hit" and not early_hit:
+            assert tuner._file_configs["specialized_gemm"] == 17
+            assert tuner.cache["shared_gemm"] == 23
+    expected_saves = [] if early == "full_hit" or key_changed else list(ranks)
+    assert [rank for rank, _, _ in run.saves] == expected_saves
+    for rank, path, saved in run.saves:
+        assert path == run.cache_path(rank)
+        assert saved == run.tuners[rank].cache
+
+
+@pytest.mark.parametrize(
+    "case", ["clean", "profiled", "file_loaded", "auto_fit", "graph_downgrade"]
+)
+def test_specialized_autotune_resolves_final_rank_key_when_ready(
+    autotune_run, monkeypatch, tmp_path, case
+):
+    from vllm.config import CUDAGraphMode, DeviceConfig, ModelConfig, VllmConfig
+    from vllm.platforms import current_platform
+
+    run = autotune_run(pp=1, tp=1)
+    tuner = _AutotuneTuner(run)
+    run.tuners[0] = tuner
+    existing_layer = {
+        "profiled": "profiling_cache",
+        "file_loaded": "_file_configs",
+    }.get(case)
+    if existing_layer:
+        getattr(tuner, existing_layer)["already_warm"] = 7
+    monkeypatch.setenv("VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR", str(tmp_path))
+    config = VllmConfig()
+    if case == "auto_fit":
+        from transformers import GPT2Config
+
+        model_path = tmp_path / "model"
+        GPT2Config().save_pretrained(model_path)
+        config = VllmConfig(
+            model_config=ModelConfig(
+                str(model_path), skip_tokenizer_init=True, max_model_len=-1
+            ),
+            device_config=DeviceConfig("cpu"),
+        )
+    elif case == "graph_downgrade":
+        config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_AND_PIECEWISE
+        config.compilation_config.use_breakable_cudagraph = False
+    runner = SimpleNamespace(vllm_config=config)  # The pre-model lookup also works.
+    default_path = autotune_cache.resolve_rank_flashinfer_autotune_file(runner)
+
+    def update_block_size(config):
+        config.cache_config.block_size = 128
+
+    monkeypatch.setattr(
+        current_platform, "update_block_size_for_backend", update_block_size
+    )
+    default_block_size = config.cache_config.block_size
+    update_block_size(config)
+    final_path = autotune_cache.resolve_rank_flashinfer_autotune_file(runner)
+    assert final_path != default_path
+    config.cache_config.block_size = default_block_size
+    final_path.write_text('{"specialized_gemm": 17}')
+
+    path = autotune_cache.preload_rank_flashinfer_autotune_cache(
+        config, torch.nn.Identity()
+    )
+    if case == "clean":
+        assert path == final_path
+        assert tuner.cache == {"specialized_gemm": 17}
+    else:
+        assert path is None
+        assert tuner.load_paths == []
+        assert tuner.cache == ({"already_warm": 7} if existing_layer else {})
 
 
 def test_autotune_cache_key_normalizes_kv_init_fields():
